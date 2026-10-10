@@ -1,0 +1,281 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace VirtualPC;
+
+public sealed class VirtualMachineInfo
+{
+    public string Name { get; set; } = "";
+    public string State { get; set; } = "";
+    public int Generation { get; set; }
+    public double MemoryGB { get; set; }
+    public int ProcessorCount { get; set; }
+}
+
+public sealed record NetworkSwitch(string Name);
+
+public sealed class HyperVService
+{
+    private const string RootPath = @"C:\VirtualPC\VMs";
+
+    private static string PsQuote(string value) =>
+        "'" + value.Replace("'", "''") + "'";
+
+    private static async Task<string> RunAsync(string script)
+    {
+        string prefix =
+            "$ErrorActionPreference='Stop'; " +
+            "[Console]::OutputEncoding = " +
+            "New-Object System.Text.UTF8Encoding($false); ";
+
+        string encoded = Convert.ToBase64String(
+            Encoding.Unicode.GetBytes(prefix + script));
+
+        var start = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = "-NoLogo -NoProfile -NonInteractive " +
+                        "-EncodedCommand " + encoded,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+
+        using var process = new Process { StartInfo = start };
+
+        process.Start();
+
+        Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+        Task<string> stderr = process.StandardError.ReadToEndAsync();
+
+        await process.WaitForExitAsync();
+
+        string output = await stdout;
+        string error = await stderr;
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                string.IsNullOrWhiteSpace(error)
+                    ? $"O PowerShell terminou com código {process.ExitCode}."
+                    : error.Trim());
+        }
+
+        return output.Trim();
+    }
+
+    public async Task<List<VirtualMachineInfo>> ListAsync()
+    {
+        string script = """
+            Import-Module Hyper-V
+            $items = @(Get-VM | ForEach-Object {
+                [PSCustomObject]@{
+                    Name = $_.Name
+                    State = [string]$_.State
+                    Generation = [int]$_.Generation
+                    MemoryGB = [math]::Round(
+                        $_.MemoryStartup / 1GB, 2)
+                    ProcessorCount = [int]$_.ProcessorCount
+                }
+            })
+            ConvertTo-Json -InputObject $items -Depth 4 -Compress
+            """;
+
+        string json = await RunAsync(script);
+
+        if (string.IsNullOrWhiteSpace(json) || json == "null")
+            return [];
+
+        return JsonSerializer.Deserialize<List<VirtualMachineInfo>>(
+            json,
+            new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            }) ?? [];
+    }
+
+    public async Task<List<NetworkSwitch>> ListSwitchesAsync()
+    {
+        string script = """
+            Import-Module Hyper-V
+            $items = @(Get-VMSwitch | Select-Object -ExpandProperty Name)
+            ConvertTo-Json -InputObject $items -Compress
+            """;
+
+        string json = await RunAsync(script);
+
+        if (string.IsNullOrWhiteSpace(json) || json == "null")
+            return [];
+
+        using JsonDocument doc = JsonDocument.Parse(json);
+
+        var names = new List<NetworkSwitch>();
+
+        if (doc.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in doc.RootElement.EnumerateArray())
+            {
+                names.Add(new NetworkSwitch(item.GetString() ?? ""));
+            }
+        }
+        else if (doc.RootElement.ValueKind == JsonValueKind.String)
+        {
+            names.Add(new NetworkSwitch(
+                doc.RootElement.GetString() ?? ""));
+        }
+
+        return names;
+    }
+
+    public async Task CreateAsync(
+        string name,
+        int ramGB,
+        int diskGB,
+        int cpuCount,
+        int generation,
+        string? isoPath,
+        string? switchName)
+    {
+        if (!Regex.IsMatch(name, @"^[a-zA-Z0-9][a-zA-Z0-9 _.()-]{0,63}$"))
+            throw new ArgumentException(
+                "Nome inválido. Use até 64 caracteres: letras, números, espaço, ponto, hífen, parênteses ou sublinhado.");
+
+        if (ramGB < 1 || ramGB > 1024)
+            throw new ArgumentOutOfRangeException(nameof(ramGB));
+
+        if (diskGB < 10 || diskGB > 65536)
+            throw new ArgumentOutOfRangeException(nameof(diskGB));
+
+        if (cpuCount < 1 || cpuCount > 256)
+            throw new ArgumentOutOfRangeException(nameof(cpuCount));
+
+        if (generation is not (1 or 2))
+            throw new ArgumentOutOfRangeException(nameof(generation));
+
+        if (isoPath is not null && !File.Exists(isoPath))
+            throw new FileNotFoundException("Arquivo ISO não encontrado.", isoPath);
+
+        string qName = PsQuote(name);
+        string qRoot = PsQuote(RootPath);
+        string qIso = isoPath is null ? "$null" : PsQuote(isoPath);
+        string qSwitch = string.IsNullOrWhiteSpace(switchName)
+            ? "$null"
+            : PsQuote(switchName);
+
+        string script = $$"""
+            Import-Module Hyper-V
+
+            $name = {{qName}}
+            if (Get-VM -Name $name -ErrorAction SilentlyContinue) {
+                throw "Já existe uma máquina virtual com esse nome."
+            }
+
+            $root = {{qRoot}}
+            $base = Join-Path $root $name
+            New-Item -ItemType Directory -Path $base -Force | Out-Null
+
+            $params = @{
+                Name = $name
+                MemoryStartupBytes = [long]{{ramGB}} * 1GB
+                Generation = {{generation}}
+                NewVHDPath = Join-Path $base ($name + '.vhdx')
+                NewVHDSizeBytes = [long]{{diskGB}} * 1GB
+                Path = $base
+            }
+
+            $switchName = {{qSwitch}}
+            if ($switchName) {
+                if (-not (Get-VMSwitch -Name $switchName `
+                        -ErrorAction SilentlyContinue)) {
+                    throw "A rede virtual selecionada não existe."
+                }
+                $params.SwitchName = $switchName
+            }
+
+            New-VM @params | Out-Null
+
+            try {
+                Set-VMProcessor -VMName $name -Count {{cpuCount}}
+
+                $iso = {{qIso}}
+                if ($iso) {
+                    if ({{generation}} -eq 2) {
+                        Set-VMFirmware -VMName $name `
+                            -EnableSecureBoot Off
+                    }
+
+                    Set-VMDvdDrive -VMName $name -Path $iso
+
+                    if ({{generation}} -eq 2) {
+                        $dvd = Get-VMDvdDrive -VMName $name
+                        Set-VMFirmware -VMName $name `
+                            -FirstBootDevice $dvd
+                    }
+                }
+
+                Write-Output "Máquina criada com sucesso."
+            }
+            catch {
+                Write-Error $_
+                throw
+            }
+            """;
+
+        await RunAsync(script);
+    }
+
+    public Task StartAsync(string name)
+    {
+        return RunAsync(
+            "Import-Module Hyper-V; Start-VM -Name " +
+            PsQuote(name) + " -ErrorAction Stop | Out-Null");
+    }
+
+    public Task StopAsync(string name)
+    {
+        return RunAsync(
+            "Import-Module Hyper-V; Stop-VM -Name " +
+            PsQuote(name) + " -ErrorAction Stop");
+    }
+
+    public async Task DeleteAsync(string name)
+    {
+        string qName = PsQuote(name);
+        string qRoot = PsQuote(RootPath);
+
+        string script = $$"""
+            Import-Module Hyper-V
+            $name = {{qName}}
+            $root = [IO.Path]::GetFullPath({{qRoot}})
+            $folder = [IO.Path]::GetFullPath((Join-Path $root $name))
+
+            if (-not $folder.StartsWith(
+                $root + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Caminho de exclusão inválido."
+            }
+
+            $vm = Get-VM -Name $name -ErrorAction Stop
+            if ($vm.State -ne 'Off') {
+                throw "Desligue a máquina antes de excluí-la."
+            }
+
+            Remove-VM -Name $name -Confirm:$false
+
+            # Apaga somente a pasta gerenciada por este aplicativo.
+            # Discos externos ou armazenados em outros locais permanecem.
+            if (Test-Path -LiteralPath $folder) {
+                Remove-Item -LiteralPath $folder -Recurse -Force
+            }
+
+            Write-Output "Máquina excluída."
+            """;
+
+        await RunAsync(script);
+    }
+}
